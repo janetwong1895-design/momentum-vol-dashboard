@@ -13,12 +13,15 @@ Run locally:
 
 from __future__ import annotations
 
+import io
+import re
+import zipfile
 from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
-import pandas_datareader.data as pdr
 import plotly.graph_objects as go
 import statsmodels.api as sm
 import streamlit as st
@@ -30,6 +33,13 @@ from plotly.subplots import make_subplots
 TRADING_DAYS = 252
 RF_START = "1927-01-01"
 LOOKBACKS = {"1M": 21, "6M": 126, "12M": 252}
+
+# Public Fama-French daily ZIP archives. Fetched via stdlib urllib to avoid the
+# `pandas_datareader` dependency, which still imports `distutils` and breaks on
+# Python 3.12+ (Streamlit Community Cloud currently boots on Python 3.14).
+FF_BASE = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp"
+FF_MOM_URL = f"{FF_BASE}/F-F_Momentum_Factor_daily_CSV.zip"
+FF_5F_URL = f"{FF_BASE}/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
 
 PALETTE = {
     "raw":       "#9aa0a6",
@@ -81,20 +91,64 @@ class FamaFrenchData:
     five_factor: pd.DataFrame
 
 
+def _read_ff_zip(url: str) -> pd.DataFrame:
+    """Download a Fama-French daily ZIP, extract its CSV, and parse the daily
+    return block into a DataFrame indexed by date with numeric columns.
+
+    Handles the F-F CSV quirks: a multi-line header preamble, whitespace-padded
+    column labels, and trailing copyright lines after the data block.
+    """
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (momentum-vol-dashboard)"})
+    with urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+        with zf.open(csv_name) as f:
+            text = f.read().decode("utf-8", errors="replace")
+
+    lines = text.splitlines()
+
+    # The header row is the first line that begins with a comma followed by
+    # alphabetic column names (e.g., ",Mom" or ",Mkt-RF,SMB,HML,RMW,CMA,RF").
+    header_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith(",") and any(c.isalpha() for c in s):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError(f"Could not locate header row in {csv_name}")
+
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), index_col=0)
+    df.columns = [c.strip() for c in df.columns]
+
+    # Keep only YYYYMMDD daily rows; the file may contain a trailing monthly or
+    # annual block plus copyright text.
+    date_re = re.compile(r"^\d{8}$")
+    df.index = df.index.astype(str).str.strip()
+    df = df[df.index.to_series().map(lambda s: bool(date_re.match(s)))]
+    df.index = pd.to_datetime(df.index, format="%Y%m%d")
+    df = df.apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    return df
+
+
 @st.cache_data(show_spinner="Fetching Fama-French data from Kenneth French Data Library...", ttl=60 * 60 * 12)
 def fetch_fama_french(start: str = RF_START) -> FamaFrenchData:
-    mom_raw = pdr.DataReader("F-F_Momentum_Factor_daily", "famafrench", start=start)[0]
-    ff5_raw = pdr.DataReader("F-F_Research_Data_5_Factors_2x3_daily", "famafrench", start=start)[0]
+    mom_raw = _read_ff_zip(FF_MOM_URL)
+    ff5_raw = _read_ff_zip(FF_5F_URL)
 
-    mom_raw.columns = [c.strip() for c in mom_raw.columns]
     mom_col = "Mom" if "Mom" in mom_raw.columns else mom_raw.columns[0]
     momentum = (mom_raw[mom_col].astype(float) / 100.0).rename("Mom")
-    momentum.index = pd.to_datetime(momentum.index)
+    # F-F sentinels for missing observations
     momentum = momentum.replace([-99.99 / 100, -999 / 100], np.nan).dropna()
 
     ff5 = ff5_raw.astype(float) / 100.0
-    ff5.index = pd.to_datetime(ff5.index)
     ff5 = ff5.dropna()
+
+    start_ts = pd.Timestamp(start)
+    momentum = momentum[momentum.index >= start_ts]
+    ff5 = ff5[ff5.index >= start_ts]
 
     common = momentum.index.intersection(ff5.index)
     return FamaFrenchData(momentum=momentum.loc[common], five_factor=ff5.loc[common])
